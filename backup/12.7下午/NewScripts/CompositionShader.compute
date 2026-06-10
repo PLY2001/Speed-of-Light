@@ -1,0 +1,82 @@
+#pragma kernel CSMain
+
+Texture2D<float4> ColorStart;
+Texture2D<float> DepthStart;
+Texture2D<float4> ColorEnd;
+Texture2D<float> DepthEnd;
+
+RWTexture2D<float4> FinalFrame;
+RWStructuredBuffer<int> FinalDepthBuffer;
+
+float ImpactTime;
+float EmissionTimeStart;
+float TimeStep;
+float SpeedOfLight;
+float FarPlane;
+int BufferWidth;
+int DebugMode;
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // 1. 读取两端的深度
+    float d_start = DepthStart[id.xy];
+    float d_end = DepthEnd[id.xy];
+
+    // 如果两端都是天空盒(>=0.99)，直接跳过（保持背景原样）
+    if (d_start >= 0.99 && d_end >= 0.99) return;
+
+    // 转换距离
+    float dist_start = d_start * FarPlane;
+    float dist_end = d_end * FarPlane;
+
+    // 2. 建立方程求解 t
+    float delta_dist = dist_end - dist_start;
+    float time_base_diff = ImpactTime - EmissionTimeStart;
+
+    float A = dist_start / SpeedOfLight;
+    float B = delta_dist / SpeedOfLight;
+    float C = time_base_diff;
+    float E = TimeStep;
+
+    float denominator = B + E;
+    if (abs(denominator) < 0.0001) return;
+
+    float t = (C - A) / denominator;
+
+    // 3. 验证解
+    if (t < 0.0 || t > 1.0) return;
+
+    // 4. 深度断层检查
+    if (abs(dist_start - dist_end) > 5.0f) return;
+
+    // 5. 计算插值
+    // 注意：这里是在线性空间混合，这是物理正确的
+    float finalDepthRaw = lerp(d_start, d_end, t);
+    float4 finalColor = lerp(ColorStart[id.xy], ColorEnd[id.xy], t);
+
+    // 6. 写入深度缓冲区
+    int depthAsInt = asint(finalDepthRaw);
+    int originalDepthAsInt;
+    
+    InterlockedMin(FinalDepthBuffer[id.y * BufferWidth + id.x], depthAsInt, originalDepthAsInt);
+    float originalDepth = asfloat(originalDepthAsInt);
+
+    if (finalDepthRaw <= originalDepth + 0.000001) 
+    {
+        // =========================================================
+        // 【关键修复】Gamma 校正 (Linear -> Gamma)
+        // =========================================================
+        // Compute Shader 算出的颜色是线性的，但直接输出到屏幕/UI时，
+        // 如果没有经过后期处理链，看起来会非常暗沉。
+        // 我们手动应用 sRGB 转换 (近似 pow(x, 1/2.2))。
+        
+        float3 gammaColor = pow(max(finalColor.rgb, 0.0), 1.0 / 2.2);
+        
+        // 注意：如果你发现背景（天空盒）变白了但物体颜色对了，
+        // 说明背景在Blit时已经做过一次校正。
+        // 但通常这种全屏合成需要统一输出空间。
+        
+        FinalFrame[id.xy] = float4(gammaColor, finalColor.a);
+    }
+}

@@ -1,0 +1,89 @@
+#pragma kernel CSMain
+
+// 我们现在需要两组纹理：起始状态(Start) 和 结束状态(End)
+Texture2D<float4> ColorStart;
+Texture2D<float> DepthStart;
+Texture2D<float4> ColorEnd;
+Texture2D<float> DepthEnd;
+
+RWTexture2D<float4> FinalFrame;
+RWStructuredBuffer<int> FinalDepthBuffer;
+
+float ImpactTime;     // 观察者看到这一帧的时间
+float EmissionTimeStart; // 当前时间段的起始时间 (t=0)
+float TimeStep;       // 当前时间段的长度 (dt)
+float SpeedOfLight;
+float FarPlane;
+int BufferWidth;
+int DebugMode;
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // 1. 读取两端的深度 (线性距离 / FarPlane)
+    float d_start = DepthStart[id.xy];
+    float d_end = DepthEnd[id.xy];
+
+    // 如果两端都是天空盒(>=0.99)，直接跳过
+    if (d_start >= 0.99 && d_end >= 0.99) return;
+
+    // 转换为真实世界距离
+    float dist_start = d_start * FarPlane;
+    float dist_end = d_end * FarPlane;
+
+    // 2. 建立方程
+    // 我们定义归一化时间 t (0 ~ 1)
+    // 物体在 t 时刻的距离: D(t) = dist_start + t * (dist_end - dist_start)
+    // 光从物体传到相机所需时间: TravelTime(t) = D(t) / SpeedOfLight
+    // 
+    // 此时的时间是: CurrentTime = EmissionTimeStart + t * TimeStep
+    // 光已经流逝的时间: Elapsed(t) = ImpactTime - CurrentTime
+    //
+    // 我们求解: TravelTime(t) == Elapsed(t)
+    // => (dist_start + t * delta_dist) / c = (ImpactTime - EmissionTimeStart) - t * TimeStep
+    
+    float delta_dist = dist_end - dist_start;
+    float time_base_diff = ImpactTime - EmissionTimeStart;
+
+    // 整理方程: A + B*t = C - E*t  =>  t * (B + E) = C - A
+    // A = dist_start / c
+    // B = delta_dist / c
+    // C = time_base_diff
+    // E = TimeStep
+
+    float A = dist_start / SpeedOfLight;
+    float B = delta_dist / SpeedOfLight;
+    float C = time_base_diff;
+    float E = TimeStep;
+
+    float denominator = B + E;
+
+    // 防止除以零 (极少数情况)
+    if (abs(denominator) < 0.0001) return;
+
+    float t = (C - A) / denominator;
+
+    // 3. 验证解是否有效
+    // t 必须在 [0, 1] 之间，才说明交点发生在这一帧的时间段内
+    if (t < 0.0 || t > 1.0) return;
+
+    // 4. 深度断层检查 (很重要!)
+    // 如果前后两帧深度差太大（比如物体边缘瞬间切过），插值会产生错误的拉伸连线。
+    // 我们设定一个阈值（例如 2米），超过则认为是两个不相关的物体，不进行插值。
+    if (abs(dist_start - dist_end) > 5.0f) return;
+
+    // 5. 计算插值后的精确深度和颜色
+    float finalDepthRaw = lerp(d_start, d_end, t);
+    float4 finalColor = lerp(ColorStart[id.xy], ColorEnd[id.xy], t);
+
+    // 6. 写入深度缓冲区 (标准 Z-Test 流程)
+    int depthAsInt = asint(finalDepthRaw);
+    int originalDepthAsInt;
+    InterlockedMin(FinalDepthBuffer[id.y * BufferWidth + id.x], depthAsInt, originalDepthAsInt);
+    float originalDepth = asfloat(originalDepthAsInt);
+
+    if (finalDepthRaw < originalDepth)
+    {
+        FinalFrame[id.xy] = finalColor;
+    }
+}
